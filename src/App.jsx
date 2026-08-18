@@ -145,6 +145,8 @@ function defaultLead() {
   return {
     id: uid("l"),
     nombre: "Nuevo lead",
+    contacto: "",
+    contactoInfo: "",
     estado: "enviado",
     fechaEnvio: new Date().toISOString().slice(0, 10),
     fechaRespuesta: null,
@@ -282,8 +284,8 @@ function normalizarData(raw) {
   merged.medios = raw?.medios || base.medios;
   merged.demanda = raw?.demanda || base.demanda;
   merged.demanda.leads = {
-    fundraising: merged.demanda.leads?.fundraising || [],
-    comercial: merged.demanda.leads?.comercial || [],
+    fundraising: (merged.demanda.leads?.fundraising || []).map(l => ({ contacto: "", contactoInfo: "", ...l })),
+    comercial: (merged.demanda.leads?.comercial || []).map(l => ({ contacto: "", contactoInfo: "", ...l })),
   };
   merged.redes = raw?.redes || base.redes;
   return merged;
@@ -295,6 +297,8 @@ export default function App() {
   const [loaded, setLoaded] = useState(false);
   const [tab, setTab] = useState("resumen");
   const [saving, setSaving] = useState(false);
+  const saveTimerRef = React.useRef(null);
+  const pendingRef = React.useRef(null);
 
   useEffect(() => {
     let mounted = true;
@@ -312,12 +316,21 @@ export default function App() {
     return () => { mounted = false; };
   }, []);
 
+  // Actualiza la pantalla al instante, pero solo manda UNA escritura a la base de
+  // datos después de que el usuario deje de teclear/hacer cambios por 600ms.
+  // Esto evita que dos guardados casi simultáneos lleguen desordenados y uno
+  // viejo sobreescriba a uno más nuevo (lo que hacía que "se borraran" cambios).
   const save = useCallback((next) => {
     setData(next);
+    pendingRef.current = next;
     setSaving(true);
-    saveData("dashboard-data", JSON.stringify(next))
-      .catch(() => {})
-      .finally(() => setTimeout(() => setSaving(false), 400));
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      const toSave = pendingRef.current;
+      saveData("dashboard-data", JSON.stringify(toSave))
+        .catch(() => {})
+        .finally(() => setSaving(false));
+    }, 600);
   }, []);
 
   // ---------- cálculos derivados ----------
@@ -993,6 +1006,17 @@ function Demanda({ data, save, stats }) {
   const marcarPerdido = (categoria, lead) => {
     updateLead(categoria, lead.id, { estado: "cerrado", resultado: "perdido", fechaCierre: new Date().toISOString().slice(0, 10) });
   };
+  // permite saltar directo a cualquier etapa (útil para cargar leads que ya
+  // avanzaron o se cerraron en meses anteriores). Si esa etapa no tiene fecha
+  // todavía, le pone la de hoy como punto de partida, editable después.
+  const setEtapa = (categoria, lead, nuevaEtapaKey) => {
+    const stage = LEAD_STAGES.find(s => s.key === nuevaEtapaKey);
+    const patch = { estado: nuevaEtapaKey };
+    if (stage && !lead[stage.dateField]) {
+      patch[stage.dateField] = new Date().toISOString().slice(0, 10);
+    }
+    updateLead(categoria, lead.id, patch);
+  };
 
   const chartData = d.citas.map(c => ({ mes: c.mes.slice(0, 3), citas: c.valor }));
 
@@ -1014,8 +1038,8 @@ function Demanda({ data, save, stats }) {
         <MiniStat label="Avance vs meta citas" value={pct(stats.citasRatio)} />
       </div>
 
-      <LeadBoard titulo="Fundraising" categoria="fundraising" leads={leads.fundraising} addLead={addLead} updateLead={updateLead} removeLead={removeLead} avanzarLead={avanzarLead} marcarPerdido={marcarPerdido} />
-      <LeadBoard titulo="Leads comerciales" categoria="comercial" leads={leads.comercial} addLead={addLead} updateLead={updateLead} removeLead={removeLead} avanzarLead={avanzarLead} marcarPerdido={marcarPerdido} />
+      <LeadBoard titulo="Fundraising" categoria="fundraising" leads={leads.fundraising} addLead={addLead} updateLead={updateLead} removeLead={removeLead} avanzarLead={avanzarLead} marcarPerdido={marcarPerdido} setEtapa={setEtapa} />
+      <LeadBoard titulo="Leads comerciales" categoria="comercial" leads={leads.comercial} addLead={addLead} updateLead={updateLead} removeLead={removeLead} avanzarLead={avanzarLead} marcarPerdido={marcarPerdido} setEtapa={setEtapa} />
 
       <Card>
         <SectionLabel>Citas con nuevos clientes por mes</SectionLabel>
@@ -1054,7 +1078,10 @@ function Demanda({ data, save, stats }) {
 }
 
 // tablero tipo kanban para seguir leads de fundraising o comerciales
-function LeadBoard({ titulo, categoria, leads, addLead, updateLead, removeLead, avanzarLead, marcarPerdido }) {
+function LeadBoard({ titulo, categoria, leads, addLead, updateLead, removeLead, avanzarLead, marcarPerdido, setEtapa }) {
+  const [expandedLeads, setExpandedLeads] = useState({});
+  const toggleExpand = (id) => setExpandedLeads(e => ({ ...e, [id]: !e[id] }));
+
   return (
     <Card>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
@@ -1065,7 +1092,7 @@ function LeadBoard({ titulo, categoria, leads, addLead, updateLead, removeLead, 
         {LEAD_STAGES.map(stage => {
           const leadsEnEtapa = leads.filter(l => l.estado === stage.key);
           return (
-            <div key={stage.key} style={{ minWidth: 220, flex: "1 1 220px" }}>
+            <div key={stage.key} style={{ minWidth: 240, flex: "1 1 240px" }}>
               <div style={{
                 display: "flex", justifyContent: "space-between", alignItems: "center",
                 background: stage.bg, color: stage.fg, borderRadius: 8, padding: "6px 10px", marginBottom: 8,
@@ -1074,51 +1101,105 @@ function LeadBoard({ titulo, categoria, leads, addLead, updateLead, removeLead, 
                 <span style={{ fontFamily: FONT_MONO, fontSize: 12 }}>{leadsEnEtapa.length}</span>
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {leadsEnEtapa.map(lead => (
-                  <div key={lead.id} style={{ border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 10, background: COLORS.card }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 6, marginBottom: 6 }}>
-                      <input
-                        value={lead.nombre}
-                        onChange={e => updateLead(categoria, lead.id, { nombre: e.target.value })}
-                        style={{ ...inputStyle, fontWeight: 500, fontSize: 12.5, flex: 1, minWidth: 0 }}
-                      />
-                      <button onClick={() => removeLead(categoria, lead.id)} style={btnGhost} aria-label="Eliminar lead"><Trash2 size={13} /></button>
-                    </div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 2, marginBottom: 8 }}>
-                      {LEAD_STAGES.filter(s => lead[s.dateField]).map(s => (
-                        <div key={s.key} style={{ fontSize: 10.5, color: COLORS.inkSoft, display: "flex", justifyContent: "space-between" }}>
-                          <span>{s.label}</span>
-                          <span style={{ fontFamily: FONT_MONO }}>{lead[s.dateField]}</span>
+                {leadsEnEtapa.map(lead => {
+                  const isExpanded = !!expandedLeads[lead.id];
+                  return (
+                    <div key={lead.id} style={{ border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 10, background: COLORS.card }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 4, marginBottom: 6 }}>
+                        <button onClick={() => toggleExpand(lead.id)} style={{ ...btnGhost, padding: 2 }} aria-label={isExpanded ? "Ocultar detalle" : "Ver detalle"}>
+                          {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                        </button>
+                        <input
+                          value={lead.nombre}
+                          onChange={e => updateLead(categoria, lead.id, { nombre: e.target.value })}
+                          style={{ ...inputStyle, fontWeight: 500, fontSize: 12.5, flex: 1, minWidth: 0 }}
+                        />
+                        <button onClick={() => removeLead(categoria, lead.id)} style={btnGhost} aria-label="Eliminar lead"><Trash2 size={13} /></button>
+                      </div>
+
+                      {lead.contacto && !isExpanded && (
+                        <div style={{ fontSize: 11, color: COLORS.inkSoft, marginBottom: 6 }}>{lead.contacto}</div>
+                      )}
+
+                      {!isExpanded && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 2, marginBottom: 8 }}>
+                          {LEAD_STAGES.filter(s => lead[s.dateField]).map(s => (
+                            <div key={s.key} style={{ fontSize: 10.5, color: COLORS.inkSoft, display: "flex", justifyContent: "space-between" }}>
+                              <span>{s.label}</span>
+                              <span style={{ fontFamily: FONT_MONO }}>{lead[s.dateField]}</span>
+                            </div>
+                          ))}
                         </div>
-                      ))}
+                      )}
+
+                      {isExpanded && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 10 }}>
+                          <Field label="Nombre de contacto">
+                            <input
+                              value={lead.contacto}
+                              onChange={e => updateLead(categoria, lead.id, { contacto: e.target.value })}
+                              placeholder="Ej: Ana Pérez"
+                              style={{ ...inputStyle, width: "100%", fontSize: 12 }}
+                            />
+                          </Field>
+                          <Field label="Teléfono o email">
+                            <input
+                              value={lead.contactoInfo}
+                              onChange={e => updateLead(categoria, lead.id, { contactoInfo: e.target.value })}
+                              placeholder="Ej: ana@correo.com"
+                              style={{ ...inputStyle, width: "100%", fontSize: 12 }}
+                            />
+                          </Field>
+                          <Field label="Etapa actual">
+                            <select
+                              value={lead.estado}
+                              onChange={e => setEtapa(categoria, lead, e.target.value)}
+                              style={{ ...selectStyle, width: "100%" }}
+                            >
+                              {LEAD_STAGES.map(s => <option key={s.key} value={s.key}>{s.label}</option>)}
+                            </select>
+                          </Field>
+                          {LEAD_STAGES.map(s => (
+                            <Field key={s.key} label={`Fecha: ${s.label}`}>
+                              <input
+                                type="date"
+                                value={lead[s.dateField] || ""}
+                                onChange={e => updateLead(categoria, lead.id, { [s.dateField]: e.target.value || null })}
+                                style={{ ...inputStyle, width: "100%", fontFamily: FONT_MONO, fontSize: 12 }}
+                              />
+                            </Field>
+                          ))}
+                        </div>
+                      )}
+
+                      {lead.estado === "cerrado" ? (
+                        <div style={{ display: "flex", gap: 6 }}>
+                          <button
+                            onClick={() => updateLead(categoria, lead.id, { resultado: "ganado" })}
+                            style={{ ...btnGhost, flex: 1, background: lead.resultado === "ganado" ? COLORS.tealSoft : COLORS.bg, color: lead.resultado === "ganado" ? COLORS.teal : COLORS.inkSoft, borderRadius: 6, fontSize: 11, padding: "4px 6px" }}
+                          >
+                            Ganado
+                          </button>
+                          <button
+                            onClick={() => updateLead(categoria, lead.id, { resultado: "perdido" })}
+                            style={{ ...btnGhost, flex: 1, background: lead.resultado === "perdido" ? COLORS.redSoft : COLORS.bg, color: lead.resultado === "perdido" ? COLORS.red : COLORS.inkSoft, borderRadius: 6, fontSize: 11, padding: "4px 6px" }}
+                          >
+                            Perdido
+                          </button>
+                        </div>
+                      ) : (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                          <button onClick={() => avanzarLead(categoria, lead)} style={{ ...btnPrimary, width: "100%", justifyContent: "center", fontSize: 11.5, padding: "6px 8px" }}>
+                            Avanzar a {LEAD_STAGES[LEAD_STAGES.findIndex(s => s.key === lead.estado) + 1]?.label} →
+                          </button>
+                          <button onClick={() => marcarPerdido(categoria, lead)} style={{ ...btnGhost, width: "100%", justifyContent: "center", fontSize: 11, color: COLORS.red }}>
+                            Marcar como perdido
+                          </button>
+                        </div>
+                      )}
                     </div>
-                    {lead.estado === "cerrado" ? (
-                      <div style={{ display: "flex", gap: 6 }}>
-                        <button
-                          onClick={() => updateLead(categoria, lead.id, { resultado: "ganado" })}
-                          style={{ ...btnGhost, flex: 1, background: lead.resultado === "ganado" ? COLORS.tealSoft : COLORS.bg, color: lead.resultado === "ganado" ? COLORS.teal : COLORS.inkSoft, borderRadius: 6, fontSize: 11, padding: "4px 6px" }}
-                        >
-                          Ganado
-                        </button>
-                        <button
-                          onClick={() => updateLead(categoria, lead.id, { resultado: "perdido" })}
-                          style={{ ...btnGhost, flex: 1, background: lead.resultado === "perdido" ? COLORS.redSoft : COLORS.bg, color: lead.resultado === "perdido" ? COLORS.red : COLORS.inkSoft, borderRadius: 6, fontSize: 11, padding: "4px 6px" }}
-                        >
-                          Perdido
-                        </button>
-                      </div>
-                    ) : (
-                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                        <button onClick={() => avanzarLead(categoria, lead)} style={{ ...btnPrimary, width: "100%", justifyContent: "center", fontSize: 11.5, padding: "6px 8px" }}>
-                          Avanzar a {LEAD_STAGES[LEAD_STAGES.findIndex(s => s.key === lead.estado) + 1]?.label} →
-                        </button>
-                        <button onClick={() => marcarPerdido(categoria, lead)} style={{ ...btnGhost, width: "100%", justifyContent: "center", fontSize: 11, color: COLORS.red }}>
-                          Marcar como perdido
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                ))}
+                  );
+                })}
                 {leadsEnEtapa.length === 0 && (
                   <div style={{ fontSize: 11.5, color: COLORS.inkSoft, fontStyle: "italic" }}>Sin leads en esta etapa</div>
                 )}
